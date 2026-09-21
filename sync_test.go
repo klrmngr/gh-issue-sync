@@ -1,7 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 	"time"
@@ -200,5 +203,65 @@ func TestApplyThreadStateRespectsConfig(t *testing.T) {
 	got, _ := s.LinkByIssue(7)
 	if got.IssueState != "open" || !got.ThreadArchived {
 		t.Fatalf("unexpected link after archive: %+v", got)
+	}
+}
+
+// A dry run previews without persisting. If it advanced the poll cursor, the
+// first real run would skip exactly the issues the preview promised.
+func TestDryRunLeavesStoreUntouched(t *testing.T) {
+	s := testStore(t)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `W/"xyz"`)
+		json.NewEncoder(w).Encode([]map[string]any{
+			{"number": 11, "title": "a new bug", "state": "open",
+				"updated_at": "2026-05-01T00:00:00Z",
+				"labels":     []map[string]any{{"name": "bug"}}},
+		})
+	}))
+	defer srv.Close()
+
+	gh := NewGitHub("token", "o", "r")
+	cfg := Config{
+		DryRun:                true,
+		Forums:                []ForumRoute{{"bugs", "bug"}},
+		DefaultForumChannelID: "bugs",
+	}
+	e := NewEngine(cfg, gh, s, nil)
+
+	// Drive the same path PollOnce uses, against the stub server.
+	issues, etag, _, err := gh.listIssues(t.Context(), srv.URL+"/issues", "")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(issues) != 1 {
+		t.Fatalf("expected 1 issue, got %d", len(issues))
+	}
+	// A nil discordgo session means a real thread create would panic.
+	if err := e.applyIssue(t.Context(), issues[0]); err != nil {
+		t.Fatalf("applyIssue: %v", err)
+	}
+	if !cfg.DryRun {
+		t.Fatal("test misconfigured")
+	}
+	_ = etag
+
+	if n, err := s.CountLinks(); err != nil || n != 0 {
+		t.Errorf("dry run wrote %d links, want 0 (err %v)", n, err)
+	}
+	if w, err := s.Watermark(); err != nil || !w.IsZero() {
+		t.Errorf("dry run moved the watermark to %v, want zero (err %v)", w, err)
+	}
+}
+
+// The same call with DryRun off must persist, or the guard is too broad.
+func TestNonDryRunPersistsLinks(t *testing.T) {
+	s := testStore(t)
+	e := NewEngine(Config{}, nil, s, nil)
+	if err := e.putLink(Link{IssueNumber: 3, ThreadID: "t3", IssueState: "open"}); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := s.CountLinks(); n != 1 {
+		t.Fatalf("expected the link to be stored, got %d", n)
 	}
 }

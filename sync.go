@@ -65,6 +65,15 @@ func (e *Engine) isEcho(threadID string) bool {
 	return ok && now.Sub(at) <= echoWindow
 }
 
+// putLink records a mapping, except during a dry run, which must leave the
+// store exactly as it found it.
+func (e *Engine) putLink(l Link) error {
+	if e.cfg.DryRun {
+		return nil
+	}
+	return e.store.PutLink(l)
+}
+
 func (e *Engine) isSelf(userID string) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -106,7 +115,7 @@ func (e *Engine) PollOnce(ctx context.Context) error {
 	if notModified {
 		return nil
 	}
-	if newETag != "" {
+	if newETag != "" && !e.cfg.DryRun {
 		_ = e.store.SetMeta("issues_etag", newETag)
 	}
 
@@ -122,7 +131,9 @@ func (e *Engine) PollOnce(ctx context.Context) error {
 			high = issue.UpdatedAt
 		}
 	}
-	if !high.IsZero() {
+	// A dry run must not move the cursor: doing so would skip, on the next
+	// real run, the very issues it just said it would mirror.
+	if !high.IsZero() && !e.cfg.DryRun {
 		if err := e.store.SetWatermark(high); err != nil {
 			return fmt.Errorf("save watermark: %w", err)
 		}
@@ -177,7 +188,7 @@ func (e *Engine) applyIssue(ctx context.Context, issue Issue) error {
 	}
 
 	link.IssueBody = issue.Body
-	return e.store.PutLink(link)
+	return e.putLink(link)
 }
 
 func (e *Engine) mirrorIssueState(threadID string, issue Issue, closed bool) error {
@@ -217,12 +228,23 @@ func (e *Engine) createThreadForIssue(issue Issue) error {
 		log.Printf("[dry-run] create thread for issue #%d %q in channel %s", issue.Number, issue.Title, channelID)
 		return nil
 	}
-	th, err := forumThreadCreate(e.dg, channelID, threadName(issue), threadBody(issue))
+	th, err := forumThreadCreate(e.dg, channelID, threadName(issue), threadEmbed(issue))
 	if err != nil {
 		return fmt.Errorf("create forum thread: %w", err)
 	}
 	log.Printf("issue #%d -> thread %s", issue.Number, th.ID)
-	return e.store.PutLink(Link{
+
+	// The starter message carries the issue; its first reply carries who filed
+	// it and how. Failing to post the reply must not orphan the thread, so the
+	// link is still recorded below.
+	if meta := metadataEmbed(issue); meta != nil {
+		e.expectEcho(th.ID)
+		if err := postEmbedToThread(e.dg, th.ID, meta); err != nil {
+			log.Printf("thread %s: post metadata: %v", th.ID, err)
+		}
+	}
+
+	return e.putLink(Link{
 		IssueNumber: issue.Number,
 		ThreadID:    th.ID,
 		IssueState:  issue.State,
@@ -292,7 +314,7 @@ func (e *Engine) fileIssueForThread(ctx context.Context, th *discordgo.Channel) 
 
 	// Record the link before announcing it: once this row exists the poller
 	// will recognise the issue as already mirrored and skip it.
-	if err := e.store.PutLink(Link{
+	if err := e.putLink(Link{
 		IssueNumber: issue.Number,
 		ThreadID:    th.ID,
 		IssueState:  issue.State,
@@ -326,7 +348,7 @@ func (e *Engine) OnThreadUpdate(ctx context.Context, t *discordgo.ThreadUpdate) 
 	if e.isEcho(th.ID) {
 		// We caused this; just record where the thread ended up.
 		link.ThreadArchived = th.ThreadMetadata.Archived
-		if err := e.store.PutLink(link); err != nil {
+		if err := e.putLink(link); err != nil {
 			log.Printf("thread %s: save link: %v", th.ID, err)
 		}
 		return
@@ -369,7 +391,7 @@ func (e *Engine) applyThreadState(ctx context.Context, th *discordgo.Channel, li
 	}
 
 	link.ThreadArchived = archived
-	return e.store.PutLink(link)
+	return e.putLink(link)
 }
 
 // OnThreadDelete stops touching a thread that no longer exists, without

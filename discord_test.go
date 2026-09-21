@@ -47,29 +47,91 @@ func TestThreadNameFitsDiscordLimit(t *testing.T) {
 	}
 }
 
-func TestThreadBodyFitsDiscordLimit(t *testing.T) {
+func TestThreadEmbedFitsDiscordLimits(t *testing.T) {
 	issue := Issue{
 		Number:  7,
-		Title:   "Overflowing",
+		Title:   strings.Repeat("Overflowing ", 40),
 		Body:    strings.Repeat("paragraph of detail ", 500),
 		HTMLURL: "https://github.com/o/r/issues/7",
 	}
 	issue.User.Login = "someone"
 
-	body := threadBody(issue)
-	if n := len([]rune(body)); n > maxMessageContent {
-		t.Fatalf("thread body is %d runes, limit is %d", n, maxMessageContent)
+	e := threadEmbed(issue)
+	if n := len([]rune(e.Description)); n > maxEmbedDescription {
+		t.Errorf("description is %d runes, limit is %d", n, maxEmbedDescription)
 	}
-	// The link must survive truncation: it is the thread's only pointer back.
-	if !strings.HasSuffix(body, issue.HTMLURL) {
-		t.Fatalf("thread body dropped the issue link, tail was %q", tail(body, 80))
+	if n := len([]rune(e.Title)); n > 256 {
+		t.Errorf("title is %d runes, limit is 256", n)
+	}
+	if e.URL != issue.HTMLURL {
+		t.Errorf("embed lost the issue link: %q", e.URL)
 	}
 }
 
-func TestThreadBodyHandlesEmptyIssue(t *testing.T) {
-	body := threadBody(Issue{Number: 1, HTMLURL: "https://example.test/1"})
-	if !strings.Contains(body, "No description provided") {
-		t.Fatalf("empty issue body should get a placeholder, got %q", body)
+// A long in-game report must lose nothing: the prose stays in the starter
+// message and the reporter block moves intact into the first reply, rather
+// than being truncated off the end of a single message.
+func TestLongReportSplitsWithoutLoss(t *testing.T) {
+	reporter := "\n\n---\n- **Reporter:** Suspicious Entity (White)\n" +
+		"- **Steam ID (unverified):** 76561198027578778\n" +
+		"- **Table version:** v0.2.12"
+	prose := strings.Repeat("a player describing the problem at length. ", 45)
+	issue := Issue{
+		Number:  99,
+		Title:   "[Bug] Something broke",
+		Body:    prose + reporter,
+		HTMLURL: "https://github.com/o/r/issues/99",
+	}
+	if n := len([]rune(issue.Body)); n <= maxMessageContent {
+		t.Fatalf("test body is only %d runes; it must exceed a message's %d to be meaningful", n, maxMessageContent)
+	}
+
+	starter := threadEmbed(issue)
+	if !strings.Contains(starter.Description, "describing the problem at length") {
+		t.Error("starter message lost the report prose")
+	}
+	if strings.Contains(starter.Description, "Suspicious Entity") {
+		t.Error("starter message should no longer carry the reporter block")
+	}
+
+	meta := metadataEmbed(issue)
+	if meta == nil {
+		t.Fatal("expected a metadata reply")
+	}
+	joined := ""
+	for _, f := range meta.Fields {
+		joined += f.Name + "=" + f.Value + ";"
+	}
+	for _, want := range []string{"Suspicious Entity (White)", "76561198027578778", "v0.2.12"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("metadata reply dropped %q (fields: %s)", want, joined)
+		}
+	}
+}
+
+func TestThreadEmbedColourAndKind(t *testing.T) {
+	bug := Issue{Labels: []struct {
+		Name string `json:"name"`
+	}{{Name: "bug"}, {Name: "in-game-report"}}}
+	if got := issueColour(bug); got != colourBug {
+		t.Errorf("bug colour = %#x, want %#x", got, colourBug)
+	}
+	if got := issueKind(bug); got != "In-game report" {
+		t.Errorf("kind = %q, want In-game report", got)
+	}
+
+	feature := Issue{Labels: []struct {
+		Name string `json:"name"`
+	}{{Name: "enhancement"}}}
+	if got := issueColour(feature); got != colourEnhancement {
+		t.Errorf("enhancement colour = %#x", got)
+	}
+	if got := issueKind(feature); got != "GitHub issue" {
+		t.Errorf("kind = %q, want GitHub issue", got)
+	}
+
+	if got := issueColour(Issue{}); got != colourDefault {
+		t.Errorf("unlabelled colour = %#x, want %#x", got, colourDefault)
 	}
 }
 
@@ -128,12 +190,4 @@ func TestIssueBodyLinksBackToThread(t *testing.T) {
 			t.Errorf("issue body missing %q:\n%s", want, body)
 		}
 	}
-}
-
-func tail(s string, n int) string {
-	r := []rune(s)
-	if len(r) <= n {
-		return s
-	}
-	return string(r[len(r)-n:])
 }

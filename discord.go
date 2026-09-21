@@ -11,8 +11,18 @@ import (
 const (
 	maxThreadName     = 100
 	maxMessageContent = 2000
+	// An embed description holds far more than a message body, which is what
+	// keeps a long report's trailing metadata block intact.
+	maxEmbedDescription = 4096
 	// Longest auto-archive window Discord offers (7 days).
 	defaultAutoArchive = 10080
+)
+
+// Embed colours, matching the repo's own label colours.
+const (
+	colourBug         = 0xd73a4a
+	colourEnhancement = 0xa2eeef
+	colourDefault     = 0x6e7681
 )
 
 // truncate cuts s to at most n runes, leaving an ellipsis when it had to cut.
@@ -32,15 +42,92 @@ func threadName(issue Issue) string {
 	return truncate(fmt.Sprintf("#%d %s", issue.Number, issue.Title), maxThreadName)
 }
 
-// threadBody is the starter message for a thread mirroring a GitHub issue.
-func threadBody(issue Issue) string {
-	body := strings.TrimSpace(issue.Body)
+// threadEmbed renders a GitHub issue as the starter message of a forum post.
+//
+// An embed rather than plain text, because an in-game report carries its
+// reporter block at the very end of the body: truncating to a message's 2000
+// characters would drop precisely the metadata worth keeping, while an embed
+// description holds 4096.
+func threadEmbed(issue Issue) *discordgo.MessageEmbed {
+	body, _ := splitReportMetadata(issue.Body)
 	if body == "" {
 		body = "_No description provided._"
 	}
-	header := fmt.Sprintf("**%s** opened [#%d](%s) on GitHub\n\n", issue.User.Login, issue.Number, issue.HTMLURL)
-	footer := "\n\n" + issue.HTMLURL
-	return header + truncate(body, maxMessageContent-len([]rune(header))-len([]rune(footer))) + footer
+	return &discordgo.MessageEmbed{
+		Title:       truncate(issue.Title, 256),
+		URL:         issue.HTMLURL,
+		Description: truncate(body, maxEmbedDescription),
+		Color:       issueColour(issue),
+		Author:      &discordgo.MessageEmbedAuthor{Name: issue.User.Login},
+		Footer: &discordgo.MessageEmbedFooter{
+			Text: fmt.Sprintf("%s #%d", issueKind(issue), issue.Number),
+		},
+	}
+}
+
+// metadataEmbed is the thread's first reply: who filed the report and how,
+// kept out of the starter message so the issue itself reads clean.
+//
+// It returns nil when there is nothing worth a second message.
+func metadataEmbed(issue Issue) *discordgo.MessageEmbed {
+	_, parsed := splitReportMetadata(issue.Body)
+
+	fields := []*discordgo.MessageEmbedField{
+		{Name: "Source", Value: issueKind(issue), Inline: true},
+		{Name: "Opened by", Value: orDash(issue.User.Login), Inline: true},
+	}
+	if labels := issueLabels(issue); len(labels) > 0 {
+		fields = append(fields, &discordgo.MessageEmbedField{
+			Name: "Labels", Value: truncate(strings.Join(labels, ", "), 1024), Inline: true,
+		})
+	}
+	for _, f := range parsed {
+		fields = append(fields, &discordgo.MessageEmbedField{
+			Name:   truncate(f.Name, 256),
+			Value:  truncate(orDash(f.Value), 1024),
+			Inline: true,
+		})
+	}
+	// Discord caps an embed at 25 fields.
+	if len(fields) > 25 {
+		fields = fields[:25]
+	}
+
+	return &discordgo.MessageEmbed{
+		Color:  issueColour(issue),
+		Fields: fields,
+		Footer: &discordgo.MessageEmbedFooter{Text: "Report details"},
+	}
+}
+
+func orDash(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "—"
+	}
+	return s
+}
+
+func issueColour(issue Issue) int {
+	for _, l := range issue.Labels {
+		switch strings.ToLower(l.Name) {
+		case "bug":
+			return colourBug
+		case "enhancement":
+			return colourEnhancement
+		}
+	}
+	return colourDefault
+}
+
+// issueKind labels the footer by where the report came from, so an in-game
+// submission is distinguishable at a glance from one filed on GitHub.
+func issueKind(issue Issue) string {
+	for _, l := range issue.Labels {
+		if strings.EqualFold(l.Name, "in-game-report") {
+			return "In-game report"
+		}
+	}
+	return "GitHub issue"
 }
 
 // issueBody is the GitHub issue body for an issue filed from a Discord thread.
@@ -59,14 +146,14 @@ func issueBody(cfg Config, thread *discordgo.Channel, author *discordgo.User, co
 }
 
 // forumThreadCreate opens a post in the forum channel and returns the thread.
-func forumThreadCreate(s *discordgo.Session, channelID, name, content string) (*discordgo.Channel, error) {
+func forumThreadCreate(s *discordgo.Session, channelID, name string, embed *discordgo.MessageEmbed) (*discordgo.Channel, error) {
 	return s.ForumThreadStartComplex(channelID,
 		&discordgo.ThreadStart{
 			Name:                truncate(name, maxThreadName),
 			AutoArchiveDuration: defaultAutoArchive,
 		},
 		&discordgo.MessageSend{
-			Content:         truncate(content, maxMessageContent),
+			Embeds:          []*discordgo.MessageEmbed{embed},
 			AllowedMentions: &discordgo.MessageAllowedMentions{Parse: []discordgo.AllowedMentionType{}},
 		})
 }
@@ -96,6 +183,15 @@ func renameThread(s *discordgo.Session, threadID, name string) error {
 func postToThread(s *discordgo.Session, threadID, content string) error {
 	_, err := s.ChannelMessageSendComplex(threadID, &discordgo.MessageSend{
 		Content:         truncate(content, maxMessageContent),
+		AllowedMentions: &discordgo.MessageAllowedMentions{Parse: []discordgo.AllowedMentionType{}},
+	})
+	return err
+}
+
+// postEmbedToThread sends an embed into a thread with mentions disabled.
+func postEmbedToThread(s *discordgo.Session, threadID string, embed *discordgo.MessageEmbed) error {
+	_, err := s.ChannelMessageSendComplex(threadID, &discordgo.MessageSend{
+		Embeds:          []*discordgo.MessageEmbed{embed},
 		AllowedMentions: &discordgo.MessageAllowedMentions{Parse: []discordgo.AllowedMentionType{}},
 	})
 	return err
