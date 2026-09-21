@@ -3,8 +3,8 @@
 **The Firemind** — keeps GitHub issues and a Discord forum channel in sync,
 both directions.
 
-- A new issue on GitHub opens a forum post.
-- A new forum post files a GitHub issue.
+- A new issue on GitHub opens a forum post, in the forum its labels route to.
+- A new forum post files a GitHub issue, labelled by the forum it came from.
 - Closing an issue archives its post; archiving a post closes its issue.
 - Reopening or un-archiving does the reverse.
 
@@ -26,6 +26,31 @@ redelivered by hand.
 
 **Discord → GitHub is event-driven** over the gateway, since the bot is already
 holding that connection.
+
+### Routing
+
+Labels decide which forum an issue belongs to, and forums decide which label a
+post gets. `FORUM_CHANNELS` declares the mapping in both directions at once:
+
+```
+FORUM_CHANNELS="123:bug,456:enhancement"
+```
+
+An issue labelled `bug` opens a post in channel 123; a post opened in 123 files
+an issue labelled `bug`. An issue carrying several routed labels takes the first
+one declared, so the result never depends on the order GitHub returns them.
+
+Issues matching no route — `triage`-only ones, say — go to
+`DEFAULT_FORUM_CHANNEL_ID`. Leave that unset and they are skipped instead;
+labelling one later bumps its `updated_at`, so the next poll picks it up.
+
+Startup fails if any routed label is missing from the repo. A typo there would
+otherwise route nothing inbound and be rejected on every outbound issue, which
+is a bad thing to discover from a dropped bug report.
+
+**A post cannot change forums.** Discord has no API to move a thread between
+forum channels, so re-labelling an issue from `bug` to `enhancement` leaves its
+post where it is. Only the initial placement is routed.
 
 ### Why it doesn't loop
 
@@ -77,9 +102,10 @@ Invite it with these permissions — OAuth2 → URL Generator, scope `bot`, or u
 | Manage Threads | archive, un-archive and rename posts |
 | Read Message History | read a post's opening message |
 
-Create a **Forum** channel for the issues, then copy its ID (Developer Mode on,
-right-click → Copy Channel ID) into `FORUM_CHANNEL_ID`. The bot refuses to start
-if that ID is not a forum channel.
+Create a **Forum** channel per issue kind — e.g. one for bug reports, one for
+feature requests — then copy each ID (Developer Mode on, right-click → Copy
+Channel ID) into `FORUM_CHANNELS` alongside the label it maps to. The bot
+refuses to start if any of them is not a forum channel in `GUILD_ID`'s server.
 
 ### 2. GitHub token
 
@@ -115,8 +141,9 @@ full list with defaults. The ones worth a second look:
   the issue. Set it to `false` if that is more noise than signal.
 - `LOCK_ON_CLOSE` (default `false`) — locking a post on close stops non-moderators
   reviving it, which also prevents the above.
-- `ISSUE_LABEL` (default `discord`) — applied to issues filed from Discord. The
-  label must already exist in the repo.
+- `ISSUE_LABEL` (default empty) — an extra provenance label added to every issue
+  filed from Discord, on top of the routed one. Useful as a counterpart to the
+  in-game reporter's `in-game-report`. Create the label first; startup checks it.
 
 ## Running without Docker
 
@@ -139,7 +166,7 @@ make test-db   # full suite against a throwaway Postgres container
 | File | Contents |
 | --- | --- |
 | `main.go` | wiring, startup checks, poll loop |
-| `config.go` | environment configuration |
+| `config.go` | environment configuration and forum/label routing |
 | `store.go` | Postgres: the issue ↔ thread mapping and the poll cursor |
 | `github.go` | GitHub REST client (list, create, open/close) |
 | `discord.go` | forum-thread helpers and the auto-archive heuristic |

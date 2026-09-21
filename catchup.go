@@ -59,7 +59,7 @@ func (e *Engine) CatchUpThreads(ctx context.Context, fileNew bool) {
 	log.Printf("catch-up: %d threads scanned, %d issues filed, %d states reconciled", len(threads), filed, reconciled)
 }
 
-// forumThreads returns the forum channel's active and recently archived posts.
+// forumThreads returns every synced forum's active and recently archived posts.
 func (e *Engine) forumThreads() ([]*discordgo.Channel, error) {
 	// Active threads are only listable guild-wide; Discord retired the
 	// per-channel endpoint.
@@ -69,17 +69,19 @@ func (e *Engine) forumThreads() ([]*discordgo.Channel, error) {
 	}
 	var out []*discordgo.Channel
 	for _, th := range active.Threads {
-		if th.ParentID == e.cfg.ForumChannelID {
+		if e.cfg.IsForum(th.ParentID) {
 			out = append(out, th)
 		}
 	}
 
-	archived, err := e.dg.ThreadsArchived(e.cfg.ForumChannelID, nil, 100)
-	if err != nil {
-		// Not fatal: active threads alone still cover the common case.
-		log.Printf("catch-up: list archived threads: %v", err)
-		return out, nil
+	for _, route := range e.cfg.Forums {
+		archived, err := e.dg.ThreadsArchived(route.ChannelID, nil, 100)
+		if err != nil {
+			// Not fatal: active threads alone still cover the common case.
+			log.Printf("catch-up: list archived threads in %s: %v", route.ChannelID, err)
+			continue
+		}
+		out = append(out, archived.Threads...)
 	}
-	out = append(out, archived.Threads...)
 	return out, nil
 }

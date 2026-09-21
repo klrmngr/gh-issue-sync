@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -59,7 +61,10 @@ func main() {
 	}
 	defer dg.Close()
 
-	if err := checkForumChannel(dg, cfg); err != nil {
+	if err := checkForumChannels(dg, cfg); err != nil {
+		log.Fatal(err)
+	}
+	if err := checkLabels(ctx, gh, cfg); err != nil {
 		log.Fatal(err)
 	}
 	fresh, err := prepareWatermark(store, cfg)
@@ -70,7 +75,7 @@ func main() {
 	if cfg.DryRun {
 		log.Printf("DRY_RUN is set: changes will be logged, not applied")
 	}
-	log.Printf("syncing %s <-> forum %s every %s", cfg.Repo(), cfg.ForumChannelID, cfg.PollInterval)
+	log.Printf("syncing %s <-> %d forum(s) every %s", cfg.Repo(), len(cfg.Forums), cfg.PollInterval)
 
 	// On a fresh database with BACKFILL=none, existing forum posts are treated
 	// as pre-existing history, exactly like the repo's existing issues.
@@ -79,18 +84,58 @@ func main() {
 	log.Printf("shutting down")
 }
 
-// checkForumChannel fails fast on the most common misconfiguration: pointing
-// FORUM_CHANNEL_ID at a normal text channel.
-func checkForumChannel(dg *discordgo.Session, cfg Config) error {
-	ch, err := dg.Channel(cfg.ForumChannelID)
+// checkForumChannels fails fast on the most common misconfiguration: pointing
+// a route at a normal text channel, or at a channel in another server.
+func checkForumChannels(dg *discordgo.Session, cfg Config) error {
+	for _, route := range cfg.Forums {
+		ch, err := dg.Channel(route.ChannelID)
+		if err != nil {
+			return fmt.Errorf("forum channel %s: %w", route.ChannelID, err)
+		}
+		if ch.Type != discordgo.ChannelTypeGuildForum {
+			return fmt.Errorf("channel %s (%s) is not a forum channel", route.ChannelID, ch.Name)
+		}
+		if ch.GuildID != cfg.GuildID {
+			return fmt.Errorf("channel %s (%s) is not in GUILD_ID's server", route.ChannelID, ch.Name)
+		}
+		log.Printf("forum #%s <- label %q", ch.Name, route.Label)
+	}
+	return nil
+}
+
+// checkLabels verifies the routing labels exist on GitHub. A label named here
+// but missing there would route nothing inbound and reject every issue the bot
+// tried to file outbound, so it is worth catching at startup rather than the
+// first time somebody reports a bug.
+func checkLabels(ctx context.Context, gh *GitHub, cfg Config) error {
+	wanted := cfg.RouteLabels()
+	if cfg.IssueLabel != "" {
+		wanted = append(wanted, cfg.IssueLabel)
+	}
+	if len(wanted) == 0 {
+		return nil
+	}
+
+	existing, err := gh.ListLabels(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("list labels: %w", err)
 	}
-	if ch.Type != discordgo.ChannelTypeGuildForum {
-		return errors.New("FORUM_CHANNEL_ID must be a forum channel")
+	var missing []string
+	for _, want := range wanted {
+		found := false
+		for _, have := range existing {
+			if strings.EqualFold(have, want) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			missing = append(missing, want)
+		}
 	}
-	if ch.GuildID != cfg.GuildID {
-		return errors.New("FORUM_CHANNEL_ID is not in GUILD_ID's server")
+	if len(missing) > 0 {
+		return fmt.Errorf("labels not found in %s: %s (create them, or change the config)",
+			cfg.Repo(), strings.Join(missing, ", "))
 	}
 	return nil
 }

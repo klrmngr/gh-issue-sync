@@ -238,3 +238,26 @@ func (g *GitHub) CommentOnIssue(ctx context.Context, number int, body string) er
 	_, _, err := g.do(ctx, http.MethodPost, u, map[string]any{"body": body}, nil)
 	return err
 }
+
+// ListLabels returns every label defined in the repository.
+func (g *GitHub) ListLabels(ctx context.Context) ([]string, error) {
+	u := fmt.Sprintf("%s/repos/%s/%s/labels?per_page=100", githubAPI, g.owner, g.repo)
+	var out []string
+	for u != "" {
+		resp, data, err := g.do(ctx, http.MethodGet, u, nil, nil)
+		if err != nil {
+			return nil, err
+		}
+		var page []struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal(data, &page); err != nil {
+			return nil, fmt.Errorf("decode labels: %w", err)
+		}
+		for _, l := range page {
+			out = append(out, l.Name)
+		}
+		u = nextPage(resp)
+	}
+	return out, nil
+}

@@ -206,11 +206,18 @@ func (e *Engine) mirrorIssueState(threadID string, issue Issue, closed bool) err
 }
 
 func (e *Engine) createThreadForIssue(issue Issue) error {
-	if e.cfg.DryRun {
-		log.Printf("[dry-run] create thread for issue #%d %q", issue.Number, issue.Title)
+	channelID := e.cfg.ForumForIssue(issueLabels(issue))
+	if channelID == "" {
+		// No route claims this issue and no default is set. Labelling it later
+		// bumps its updated_at, so the next poll will pick it up.
+		log.Printf("issue #%d: no forum matches its labels, skipping", issue.Number)
 		return nil
 	}
-	th, err := forumThreadCreate(e.dg, e.cfg.ForumChannelID, threadName(issue), threadBody(issue))
+	if e.cfg.DryRun {
+		log.Printf("[dry-run] create thread for issue #%d %q in channel %s", issue.Number, issue.Title, channelID)
+		return nil
+	}
+	th, err := forumThreadCreate(e.dg, channelID, threadName(issue), threadBody(issue))
 	if err != nil {
 		return fmt.Errorf("create forum thread: %w", err)
 	}
@@ -230,7 +237,7 @@ func (e *Engine) createThreadForIssue(issue Issue) error {
 // OnThreadCreate files a GitHub issue for a forum post a human just opened.
 func (e *Engine) OnThreadCreate(ctx context.Context, t *discordgo.ThreadCreate) {
 	th := t.Channel
-	if th == nil || th.ParentID != e.cfg.ForumChannelID {
+	if th == nil || !e.cfg.IsForum(th.ParentID) {
 		return
 	}
 	// THREAD_CREATE also fires when the bot simply gains access to an old
@@ -269,9 +276,13 @@ func (e *Engine) fileIssueForThread(ctx context.Context, th *discordgo.Channel) 
 		return nil
 	}
 
+	// The forum a post was opened in decides the issue's kind.
 	var labels []string
+	if routed := e.cfg.LabelForForum(th.ParentID); routed != "" {
+		labels = append(labels, routed)
+	}
 	if e.cfg.IssueLabel != "" {
-		labels = []string{e.cfg.IssueLabel}
+		labels = append(labels, e.cfg.IssueLabel)
 	}
 	issue, err := e.gh.CreateIssue(ctx, th.Name, issueBody(e.cfg, th, author, content), labels)
 	if err != nil {
@@ -301,7 +312,7 @@ func (e *Engine) fileIssueForThread(ctx context.Context, th *discordgo.Channel) 
 // OnThreadUpdate mirrors a human archiving or reviving a post.
 func (e *Engine) OnThreadUpdate(ctx context.Context, t *discordgo.ThreadUpdate) {
 	th := t.Channel
-	if th == nil || th.ParentID != e.cfg.ForumChannelID || th.ThreadMetadata == nil {
+	if th == nil || !e.cfg.IsForum(th.ParentID) || th.ThreadMetadata == nil {
 		return
 	}
 	link, err := e.store.LinkByThread(th.ID)
@@ -364,7 +375,7 @@ func (e *Engine) applyThreadState(ctx context.Context, th *discordgo.Channel, li
 // OnThreadDelete stops touching a thread that no longer exists, without
 // recreating it the next time its issue is updated.
 func (e *Engine) OnThreadDelete(t *discordgo.ThreadDelete) {
-	if t.Channel == nil || t.Channel.ParentID != e.cfg.ForumChannelID {
+	if t.Channel == nil || !e.cfg.IsForum(t.Channel.ParentID) {
 		return
 	}
 	if _, err := e.store.LinkByThread(t.Channel.ID); err != nil {
@@ -375,6 +386,14 @@ func (e *Engine) OnThreadDelete(t *discordgo.ThreadDelete) {
 		return
 	}
 	log.Printf("thread %s deleted; its issue will no longer be mirrored", t.Channel.ID)
+}
+
+func issueLabels(issue Issue) []string {
+	out := make([]string, 0, len(issue.Labels))
+	for _, l := range issue.Labels {
+		out = append(out, l.Name)
+	}
+	return out
 }
 
 func threadAge(th *discordgo.Channel) time.Duration {
